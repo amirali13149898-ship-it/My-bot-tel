@@ -5,8 +5,8 @@
 """
 
 import os
+import sys
 import logging
-import asyncio
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -26,18 +26,55 @@ from telegram.ext import (
 
 import database as db
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 log = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-PORT = int(os.environ.get("PORT", 10000))
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # مثلا https://your-app.onrender.com
-TARGET_CHANNEL = os.environ.get("TARGET_CHANNEL", "")  # چنلی که پست‌ها اونجا منتشر میشن
+
+# =========================================================
+#           خواندن و اعتبارسنجی متغیرهای محیطی
+# =========================================================
+# به‌جای اینکه بات با یه Traceback نامفهوم بترکه، اول چک می‌کنیم
+# همه‌ی متغیرهای لازم ست شدن؛ اگه نه، یه پیام واضح تو لاگ چاپ می‌کنیم.
+
+REQUIRED_ENV_VARS = ["BOT_TOKEN", "WEBHOOK_URL"]
+
+
+def load_env():
+    missing = [name for name in REQUIRED_ENV_VARS if not os.environ.get(name)]
+    if missing:
+        log.error(
+            "متغیرهای محیطی زیر ست نشدن: %s — از تب Environment توی Render اضافه‌شون کن.",
+            ", ".join(missing),
+        )
+        sys.exit(1)
+
+    bot_token = os.environ["BOT_TOKEN"]
+    webhook_url = os.environ["WEBHOOK_URL"].rstrip("/")
+    port = int(os.environ.get("PORT", 10000))
+    target_channel = os.environ.get("TARGET_CHANNEL", "").strip()
+
+    return bot_token, webhook_url, port, target_channel
+
+
+BOT_TOKEN, WEBHOOK_URL, PORT, TARGET_CHANNEL = load_env()
 
 # ---------- مراحل گفتگوی ساخت پست ----------
 WAIT_CONTENT, WAIT_BTN_NAME, WAIT_BTN_LINK, WAIT_MORE, WAIT_CONFIRM = range(5)
 
 YES_NO_KB = ReplyKeyboardMarkup([["بله", "خیر"]], resize_keyboard=True)
+
+
+def target_chat_id():
+    """chat_id مقصد رو برمی‌گردونه: اگه عددیه به int تبدیل می‌کنه، وگرنه یوزرنیم/آیدی رشته‌ای رو همون‌جوری برمی‌گردونه."""
+    if not TARGET_CHANNEL:
+        return None
+    try:
+        return int(TARGET_CHANNEL)
+    except ValueError:
+        return TARGET_CHANNEL
 
 
 # =========================================================
@@ -52,7 +89,8 @@ async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
             member = await context.bot.get_chat_member(ch["chat_id"], user_id)
             if member.status in ("left", "kicked"):
                 missing.append(ch)
-        except Exception:
+        except Exception as e:
+            log.warning("بررسی عضویت تو %s شکست خورد: %s", ch.get("chat_id"), e)
             missing.append(ch)
     return missing
 
@@ -60,9 +98,11 @@ async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
 def force_join_keyboard(missing: list) -> InlineKeyboardMarkup:
     rows = []
     for ch in missing:
-        link = ch["chat_id"] if str(ch["chat_id"]).startswith("@") else ch.get("title", "چنل")
-        rows.append([InlineKeyboardButton(f"عضویت در {ch.get('title') or ch['chat_id']}",
-                                           url=f"https://t.me/{str(ch['chat_id']).lstrip('@')}")])
+        username = str(ch["chat_id"]).lstrip("@")
+        rows.append([InlineKeyboardButton(
+            f"عضویت در {ch.get('title') or ch['chat_id']}",
+            url=f"https://t.me/{username}",
+        )])
     rows.append([InlineKeyboardButton("✅ عضو شدم", callback_data="check_join")])
     return InlineKeyboardMarkup(rows)
 
@@ -85,10 +125,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ اجازه‌ی استفاده از این بات رو نداری. از ادمین بخواه بهت دسترسی بده.")
         return
 
-    await update.message.reply_text(
-        f"سلام! خوش اومدی.\nآیدی عددیت: {user_id}\n"
-        + ("تو ادمینی، /panel رو بزن." if db.is_admin(user_id) else "")
-    )
+    text = f"سلام! خوش اومدی.\nآیدی عددیت: {user_id}"
+    if db.is_admin(user_id):
+        text += "\nتو ادمینی، /panel رو بزن."
+    await update.message.reply_text(text)
 
 
 async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -133,12 +173,16 @@ async def close_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not db.is_owner(user_id) and not db.is_admin(user_id):
+    if not db.is_admin(user_id):
         return
     if not context.args:
         await update.message.reply_text("فرمت: /addadmin <user_id>")
         return
-    target = int(context.args[0])
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("آیدی عددی باید عدد باشه.")
+        return
     db.add_admin(target, added_by=user_id)
     await update.message.reply_text(f"کاربر {target} ادمین شد.")
 
@@ -151,7 +195,12 @@ async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("فرمت: /removeadmin <user_id>")
         return
-    db.remove_admin(int(context.args[0]))
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("آیدی عددی باید عدد باشه.")
+        return
+    db.remove_admin(target)
     await update.message.reply_text("حذف شد.")
 
 
@@ -159,8 +208,11 @@ async def list_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         return
     admins = db.list_admins()
-    text = "لیست ادمین‌ها:\n" + "\n".join(f"- {a['user_id']} ({a['level']})" for a in admins) or "خالیه."
-    await update.message.reply_text(text)
+    if not admins:
+        await update.message.reply_text("لیست ادمین‌ها خالیه.")
+        return
+    lines = "\n".join(f"- {a['user_id']} ({a['level']})" for a in admins)
+    await update.message.reply_text("لیست ادمین‌ها:\n" + lines)
 
 
 # ---- مدیریت کاربران مجاز ----
@@ -171,7 +223,11 @@ async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("فرمت: /allow <user_id>")
         return
-    target = int(context.args[0])
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("آیدی عددی باید عدد باشه.")
+        return
     db.allow_user(target, added_by=update.effective_user.id)
     await update.message.reply_text(f"کاربر {target} مجاز شد.")
 
@@ -182,7 +238,12 @@ async def disallow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("فرمت: /disallow <user_id>")
         return
-    db.disallow_user(int(context.args[0]))
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("آیدی عددی باید عدد باشه.")
+        return
+    db.disallow_user(target)
     await update.message.reply_text("دسترسی گرفته شد.")
 
 
@@ -213,7 +274,10 @@ async def force_list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_admin(update.effective_user.id):
         return
     chans = db.list_force_channels()
-    text = "\n".join(f"- {c['chat_id']}" for c in chans) or "خالیه."
+    if not chans:
+        await update.message.reply_text("لیست عضویت اجباری خالیه.")
+        return
+    text = "\n".join(f"- {c['chat_id']}" for c in chans)
     await update.message.reply_text(text)
 
 
@@ -245,10 +309,15 @@ async def newpost_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["content_type"] = "document"
         context.user_data["file_id"] = msg.document.file_id
         context.user_data["caption"] = msg.caption or ""
-    else:
+    elif msg.text:
         context.user_data["content_type"] = "text"
         context.user_data["file_id"] = None
-        context.user_data["caption"] = msg.text or ""
+        context.user_data["caption"] = msg.text
+    else:
+        await update.message.reply_text(
+            "این نوع پیام پشتیبانی نمیشه. متن، عکس، ویدیو یا فایل بفرست."
+        )
+        return WAIT_CONTENT
 
     context.user_data["buttons"] = []
     await update.message.reply_text(
@@ -260,6 +329,9 @@ async def newpost_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def newpost_btn_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("اسم دکمه نمی‌تونه خالی باشه، دوباره بفرست:")
+        return WAIT_BTN_NAME
     context.user_data["pending_btn_name"] = name
     await update.message.reply_text(
         f'لینکی که می‌خوای برای دکمه‌ی «{name}» بذاری رو بفرست.\n'
@@ -270,7 +342,7 @@ async def newpost_btn_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def newpost_btn_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = update.message.text.strip()
-    name = context.user_data.pop("pending_btn_name")
+    name = context.user_data.pop("pending_btn_name", "دکمه")
 
     if link == "-":
         context.user_data["buttons"].append({"text": name, "action": "vote"})
@@ -336,23 +408,27 @@ async def newpost_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons = context.user_data["buttons"]
 
     post_id = db.create_post(creator_id, ctype, file_id, caption, buttons)
-
     kb = build_post_keyboard(post_id, buttons)
 
-    if not TARGET_CHANNEL:
+    target = target_chat_id()
+    if target is None:
         await update.message.reply_text("⚠️ TARGET_CHANNEL تنظیم نشده، پست فقط اینجا نمایش داده شد.")
         target = update.effective_chat.id
-    else:
-        target = TARGET_CHANNEL
 
-    if ctype == "text":
-        await context.bot.send_message(target, caption or "", reply_markup=kb)
-    elif ctype == "photo":
-        await context.bot.send_photo(target, file_id, caption=caption, reply_markup=kb)
-    elif ctype == "video":
-        await context.bot.send_video(target, file_id, caption=caption, reply_markup=kb)
-    elif ctype == "document":
-        await context.bot.send_document(target, file_id, caption=caption, reply_markup=kb)
+    try:
+        if ctype == "text":
+            await context.bot.send_message(target, caption or "", reply_markup=kb)
+        elif ctype == "photo":
+            await context.bot.send_photo(target, file_id, caption=caption, reply_markup=kb)
+        elif ctype == "video":
+            await context.bot.send_video(target, file_id, caption=caption, reply_markup=kb)
+        elif ctype == "document":
+            await context.bot.send_document(target, file_id, caption=caption, reply_markup=kb)
+    except Exception as e:
+        log.exception("ارسال پست به کانال شکست خورد")
+        await update.message.reply_text(f"❌ ارسال پست شکست خورد: {e}", reply_markup=ADMIN_MENU)
+        context.user_data.clear()
+        return ConversationHandler.END
 
     await update.message.reply_text("✅ پست منتشر شد.", reply_markup=ADMIN_MENU)
     context.user_data.clear()
@@ -381,8 +457,13 @@ def build_post_keyboard(post_id: int, buttons: list) -> InlineKeyboardMarkup:
 
 async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    _, post_id_s, idx_s = query.data.split(":")
-    post_id, idx = int(post_id_s), int(idx_s)
+    try:
+        _, post_id_s, idx_s = query.data.split(":")
+        post_id, idx = int(post_id_s), int(idx_s)
+    except (ValueError, AttributeError):
+        await query.answer("خطای داخلی، دوباره امتحان کن.", show_alert=True)
+        return
+
     user_id = query.from_user.id
 
     missing = await check_force_join(user_id, context)
@@ -405,7 +486,6 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db.add_vote(post_id, user_id, idx)
     counts = db.vote_counts(post_id)
-    total = sum(counts.values())
 
     new_rows = []
     for i, b in enumerate(post["buttons"]):
@@ -416,7 +496,10 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             new_rows.append([InlineKeyboardButton(label, callback_data=f"vote:{post_id}:{i}")])
 
-    await query.edit_message_reply_markup(InlineKeyboardMarkup(new_rows))
+    try:
+        await query.edit_message_reply_markup(InlineKeyboardMarkup(new_rows))
+    except Exception as e:
+        log.warning("آپدیت دکمه‌های پیام شکست خورد: %s", e)
     await query.answer("رأیت ثبت شد ✅")
 
 
@@ -434,7 +517,7 @@ async def add_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_source_channel(chat_id, title=chat_id)
     await update.message.reply_text(
         f"{chat_id} اضافه شد.\n"
-        "⚠️ توجه: بات فقط پست‌های *جدید بعد از این لحظه* رو از این کانال می‌بینه و می‌تونه "
+        "توجه: بات فقط پست‌های جدید بعد از این لحظه رو از این کانال می‌بینه و می‌تونه "
         "خودکار روش دکمه بذاره. گرفتن پست‌های قدیمی/آرشیو با توکن بات ممکن نیست؛ "
         "برای اون باید از یه اکانت یوزر (Telethon/Pyrogram) استفاده کرد، که یه پروژه‌ی جدا و پیچیده‌تره."
     )
@@ -443,14 +526,22 @@ async def add_source_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """وقتی تو یه چنل مبدا پست جدید میاد، اگه چنل ثبت شده باشه، دکمه پیش‌فرض بهش اضافه می‌کنیم."""
     post = update.channel_post
-    if not post:
+    if not post or not post.chat:
         return
-    sources = {c["chat_id"].lstrip("@") for c in db.list_source_channels()}
-    username = (post.chat.username or "")
+    sources = {str(c["chat_id"]).lstrip("@") for c in db.list_source_channels()}
+    username = post.chat.username or ""
     if username not in sources:
         return
     # فقط یه نمونه‌ی ساده: میشه اینجا منطق دلخواه (کپی به کانال هدف با دکمه) اضافه کرد.
-    log.info(f"پست جدید از چنل مبدا رصد شد: {post.chat.username} / {post.message_id}")
+    log.info("پست جدید از چنل مبدا رصد شد: %s / %s", post.chat.username, post.message_id)
+
+
+# =========================================================
+#                    مدیریت خطاهای عمومی
+# =========================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("خطای پیش‌بینی‌نشده هنگام پردازش آپدیت %s:", update, exc_info=context.error)
 
 
 # =========================================================
@@ -458,6 +549,9 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 # =========================================================
 
 def main():
+    log.info("Python %s", sys.version)
+    log.info("در حال ساخت اپلیکیشن بات...")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -494,11 +588,16 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^❌ بستن پنل$"), close_panel))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post_handler))
 
+    app.add_error_handler(error_handler)
+
+    webhook_full_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+    log.info("در حال اجرای وبهوک روی پورت %s ...", PORT)
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=BOT_TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+        webhook_url=webhook_full_url,
+        drop_pending_updates=True,
     )
 
 
