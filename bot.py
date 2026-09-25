@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 بات پست + دکمه شیشه‌ای انتخابی
-اجرا روی Render به صورت Webhook
+اجرا به روش polling (روی Render باید به عنوان Background Worker دیپلوی شه)
 """
 
 import os
@@ -36,10 +36,8 @@ log = logging.getLogger(__name__)
 # =========================================================
 #           خواندن و اعتبارسنجی متغیرهای محیطی
 # =========================================================
-# به‌جای اینکه بات با یه Traceback نامفهوم بترکه، اول چک می‌کنیم
-# همه‌ی متغیرهای لازم ست شدن؛ اگه نه، یه پیام واضح تو لاگ چاپ می‌کنیم.
 
-REQUIRED_ENV_VARS = ["BOT_TOKEN", "WEBHOOK_URL"]
+REQUIRED_ENV_VARS = ["BOT_TOKEN"]
 
 
 def load_env():
@@ -52,14 +50,12 @@ def load_env():
         sys.exit(1)
 
     bot_token = os.environ["BOT_TOKEN"]
-    webhook_url = os.environ["WEBHOOK_URL"].rstrip("/")
-    port = int(os.environ.get("PORT", 10000))
     target_channel = os.environ.get("TARGET_CHANNEL", "").strip()
 
-    return bot_token, webhook_url, port, target_channel
+    return bot_token, target_channel
 
 
-BOT_TOKEN, WEBHOOK_URL, PORT, TARGET_CHANNEL = load_env()
+BOT_TOKEN, TARGET_CHANNEL = load_env()
 
 # ---------- مراحل گفتگوی ساخت پست ----------
 WAIT_CONTENT, WAIT_BTN_NAME, WAIT_BTN_LINK, WAIT_MORE, WAIT_CONFIRM = range(5)
@@ -532,7 +528,6 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     username = post.chat.username or ""
     if username not in sources:
         return
-    # فقط یه نمونه‌ی ساده: میشه اینجا منطق دلخواه (کپی به کانال هدف با دکمه) اضافه کرد.
     log.info("پست جدید از چنل مبدا رصد شد: %s / %s", post.chat.username, post.message_id)
 
 
@@ -590,15 +585,8 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    webhook_full_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
-    log.info("در حال اجرای وبهوک روی پورت %s ...", PORT)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=webhook_full_url,
-        drop_pending_updates=True,
-    )
+    log.info("در حال اجرای بات به روش polling ...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
