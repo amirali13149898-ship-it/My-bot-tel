@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 بات پست + دکمه شیشه‌ای انتخابی
-اجرا به روش polling (روی Render باید به عنوان Background Worker دیپلوی شه)
+اجرا به روش polling + یه سرور فیک HTTP کوچیک که فقط برای اینه که
+روی Render به عنوان Web Service (رایگان) هم درست دیپلوی و healthy بشه.
 """
 
 import os
 import sys
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -540,6 +543,29 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
+#      سرور فیک HTTP فقط برای اینکه Render فکر کنه سالمه
+# =========================================================
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK - bot is running (polling)")
+
+    def log_message(self, format, *args):
+        # لاگ‌های پیش‌فرض http.server رو خاموش می‌کنیم که شلوغ نشه
+        pass
+
+
+def start_fake_web_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    log.info("سرور فیک HTTP روی پورت %s بالا اومد (فقط برای health check رندر)", port)
+    server.serve_forever()
+
+
+# =========================================================
 #                          main
 # =========================================================
 
@@ -584,6 +610,9 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post_handler))
 
     app.add_error_handler(error_handler)
+
+    # سرور فیک رو تو یه ترد جدا بالا میاریم تا Render پورت رو باز ببینه
+    threading.Thread(target=start_fake_web_server, daemon=True).start()
 
     log.info("در حال اجرای بات به روش polling ...")
     app.run_polling(drop_pending_updates=True)
