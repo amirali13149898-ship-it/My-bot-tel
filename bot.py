@@ -199,6 +199,12 @@ async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("آیدی عددی باید عدد باشه.")
         return
+    if db.is_env_admin(target):
+        await update.message.reply_text(
+            "این کاربر از طریق ADMIN_IDS تو Render ادمین شده، نه از دیتابیس.\n"
+            "برای حذفش باید آیدیش رو از متغیر ADMIN_IDS تو تب Environment رندر پاک کنی."
+        )
+        return
     db.remove_admin(target)
     await update.message.reply_text("حذف شد.")
 
