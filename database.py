@@ -10,6 +10,27 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 
+# ادمین‌های ثابتی که مستقیم از Environment Variables رندر تنظیم می‌شن.
+# تو تب Environment رندر یه متغیر به اسم ADMIN_IDS بساز و آیدی عددی
+# ادمین‌ها رو با کاما جدا کن، مثلا: ADMIN_IDS=111111111,222222222
+# نیازی به ری‌استارت دستی نیست؛ رندر با تغییر Environment Variable
+# خودش سرویس رو دوباره دیپلوی می‌کنه.
+def _parse_env_admin_ids() -> set:
+    raw = os.environ.get("ADMIN_IDS", "")
+    ids = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            pass
+    return ids
+
+
+ENV_ADMIN_IDS = _parse_env_admin_ids()
+
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
@@ -19,8 +40,13 @@ def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
 
+def is_env_admin(user_id: int) -> bool:
+    """ادمینی که فقط از طریق ADMIN_IDS تو Render تعریف شده (توی دیتابیس نیست)."""
+    return user_id in ENV_ADMIN_IDS
+
+
 def is_admin(user_id: int) -> bool:
-    if is_owner(user_id):
+    if is_owner(user_id) or is_env_admin(user_id):
         return True
     res = sb.table("admins").select("user_id").eq("user_id", user_id).execute()
     return len(res.data) > 0
@@ -35,7 +61,12 @@ def remove_admin(user_id: int):
 
 
 def list_admins():
-    return sb.table("admins").select("*").execute().data
+    db_admins = sb.table("admins").select("*").execute().data
+    env_admins = [
+        {"user_id": uid, "level": "env (Render)", "added_by": None}
+        for uid in ENV_ADMIN_IDS
+    ]
+    return env_admins + db_admins
 
 
 # ---------- کاربران مجاز ----------
